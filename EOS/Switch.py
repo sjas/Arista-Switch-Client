@@ -22,7 +22,7 @@ class Switch():
             Returns a list of dictionaries with a single key/value pair of command/output
 
         """
-        if method == "netmiko":
+        if method == "ssh":
             return self.send_commands_via_netmiko(commands, enable=enable)
         else:
             return self.send_commands_via_eapi(commands, enable=enable)
