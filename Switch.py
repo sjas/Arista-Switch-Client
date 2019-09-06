@@ -1,4 +1,3 @@
-
 class Switch():
     """
     Class to act as an EOS Switch object.  Uses Netmiko (SSH) or jsonrpclib (EAPI) to execute switch functions. 
