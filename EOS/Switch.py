@@ -4,7 +4,8 @@ from chips import chipModelInfo
 import json
 from collections import OrderedDict
 import ipaddress
-
+import switch_helpers
+ 
 class Switch():
     """
     Class to act as an EOS Switch object.  Uses Netmiko (SSH) or jsonrpclib (EAPI) to execute switch functions. 
@@ -143,8 +144,9 @@ class Switch():
 
 
     #svi_address range has to be unicode for python 2
-    def build_mlag(self, mlag_domain_id, role, svi_address_range=unicode("172.16.0.0/31"), number_of_interfaces=2, interfaces=None,
-                    port_channel=2000, vlan=4094, trunk_group_name="MLAG_Peer", ibgp=False, ibgp_address_range=None, virtual_mac="00:1c:73:00:00:34", reload_delay=(300, 360)):
+    def build_mlag(self, role, mlag_domain_id="MLAG_DOMAIN", mlag_svi_address_range=unicode("10.179.248.0/31"), number_of_interfaces=2, interfaces=None,
+                    port_channel=2000, vlan=4094, trunk_group_name="MLAG_Peer", ibgp=False, ibgp_address_range=unicode("10.179.253.0/31"), ibgp_vrfs_to_vlans={"default":1}, asn=None, 
+                    virtual_mac="00:1c:73:00:00:34", reload_delay=(300, 360)):
         """
         Returns a potential mlag configuration based on input arguments.
 
@@ -159,15 +161,20 @@ class Switch():
             ibgp_address_range -> format: "a.b.c.d/xy" - address for iBGP stuff (ask George)
         """
         mlag_config = ""
+        mlag_general_section = ""
+        mlag_vlan_section = ""
+        mlag_interface_section = ""
+        mlag_mlag_section = ""
+        mlag_vrf_section = ""
+        mlag_ibgp_section = ""
 
-        mlag_config += "ip virtual-router mac-address {}\n".format(virtual_mac)
+        mlag_mlag_section += "ip virtual-router mac-address {}\n".format(virtual_mac)
+        mlag_mlag_section += "!\n"
 
-        mlag_config += "\n"
 
-
-        hosts = list(ipaddress.ip_network(svi_address_range).hosts())
+        hosts = list(ipaddress.ip_network(mlag_svi_address_range).hosts())
         if len(hosts) < 2:
-            assert "{}  is an invalid address range for SVI".format(svi_address_range)
+            assert "{}  is an invalid address range for SVI".format(mlag_svi_address_range)
         if role == "primary":
             svi_address = hosts[0]
             peer_address = hosts[1]
@@ -193,49 +200,94 @@ class Switch():
             interfaces = next(iter(self.order_interfaces_by_most_common_speed().values()))[-(number_of_interfaces):]
 
         #Configure MLAG vlan
-        mlag_config += "vlan {}\n".format(vlan)
-        mlag_config += "  name MLAG-Peer-Vlan\n"
-        mlag_config += "  trunk group {}\n".format(trunk_group_name)
-        mlag_config += "\n"
+        mlag_vlan_section += "vlan {}\n".format(vlan)
+        mlag_vlan_section += "  name MLAG-Peer-Vlan\n"
+        mlag_vlan_section += "  trunk group {}\n".format(trunk_group_name)
+        mlag_vlan_section += "!\n"
 
         #Disable spanning tree on MLAG vlan
-        mlag_config += "no spanning-tree vlan {}\n".format(vlan)
-        mlag_config += "\n"
+        mlag_general_section += "no spanning-tree vlan {}\n".format(vlan)
+        mlag_general_section += "!\n"
 
         #Configure physical interface configs
         for interface in interfaces:
-            mlag_config += "interface {}\n".format(interface)
-            mlag_config += "  description MLAG Interface\n"
-            mlag_config += "  switchport mode trunk\n"
-            mlag_config += "  channel-group {} mode active\n".format(port_channel)
-            mlag_config += "\n"
+            mlag_interface_section += "interface {}\n".format(interface)
+            mlag_interface_section += "  description MLAG Interface\n"
+            mlag_interface_section += "  switchport mode trunk\n"
+            mlag_interface_section += "  channel-group {} mode active\n".format(port_channel)
+            mlag_interface_section += "!\n"
 
         #Configure port channel
-        mlag_config += "interface port-channel {}\n".format(port_channel)
-        mlag_config += "  description MLAG Peer Port-Channel\n"
-        mlag_config += "  load-interval {}\n".format(5)
-        mlag_config += "  switchport mode trunk\n"
-        mlag_config += "  switchport trunk group {}\n".format(trunk_group_name)
-        mlag_config += "\n"
+        mlag_interface_section += "interface Port-Channel{}\n".format(port_channel)
+        mlag_interface_section += "  description MLAG Peer Port-Channel\n"
+        mlag_interface_section += "  load-interval {}\n".format(5)
+        mlag_interface_section += "  switchport mode trunk\n"
+        mlag_interface_section += "  switchport trunk group {}\n".format(trunk_group_name)
+        mlag_interface_section += "!\n"
 
         #Configure SVI
-        mlag_config += "interface vlan {}\n".format(vlan)
-        mlag_config += "  description MLAG peer link\n"
-        mlag_config += "  mtu {}\n".format(9214)
-        mlag_config += "  no autostate\n"
-        mlag_config += "  ip address {}/{}\n".format(svi_address, ipaddress.ip_network(svi_address_range).prefixlen)
-        mlag_config += "\n"
+        mlag_interface_section += "interface Vlan{}\n".format(vlan)
+        mlag_interface_section += "  description MLAG peer link\n"
+        mlag_interface_section += "  mtu {}\n".format(9214)
+        mlag_interface_section += "  no autostate\n"
+        mlag_interface_section += "  ip address {}/{}\n".format(svi_address, ipaddress.ip_network(mlag_svi_address_range).prefixlen)
+        mlag_interface_section += "!\n"
 
         #Configure mlag
-        mlag_config += "mlag\n"
-        mlag_config += "  domain-id {}\n".format(mlag_domain_id)
-        mlag_config += "  local-interface vlan {}\n".format(vlan)
-        mlag_config += "  peer-address {}\n".format(peer_address)
-        mlag_config += "  peer-link port-channel {}\n".format(port_channel)
-        mlag_config += "  reload-delay mlag {}\n".format(reload_delay[0])
-        mlag_config += "  reload-delay non-mlag {}\n".format(reload_delay[1])
+        mlag_mlag_section += "mlag\n"
+        mlag_mlag_section += "  domain-id {}\n".format(mlag_domain_id)
+        mlag_mlag_section += "  local-interface vlan {}\n".format(vlan)
+        mlag_mlag_section += "  peer-address {}\n".format(peer_address)
+        mlag_mlag_section += "  peer-link port-channel {}\n".format(port_channel)
+        mlag_mlag_section += "  reload-delay mlag {}\n".format(reload_delay[0])
+        mlag_mlag_section += "  reload-delay non-mlag {}\n".format(reload_delay[1])
+        mlag_mlag_section += "!\n"
 
-        return mlag_config
+        if ibgp == True:
+            hosts = list(ipaddress.ip_network(ibgp_address_range).hosts())
+            if role == "primary":
+                ibgp_svi_address = hosts[0]
+                ibgp_neighbor_address = hosts[1]
+            else:
+                ibgp_svi_address = hosts[1]
+                ibgp_neighbor_address = hosts[0]
+
+            for vrf, vlan in ibgp_vrfs_to_vlans.items():
+                if vrf == "default":
+                    interface = next(iter(self.order_interfaces_by_most_common_speed().values()))[-(number_of_interfaces+1):-(number_of_interfaces)]
+                    if len(interface) == 0:
+                        assert "Could not retrieve an interface"
+                        break
+                    mlag_interface_section += "interface {}\n".format(interface[0])
+                    mlag_interface_section += "  no switchport\n"
+                    mlag_interface_section += "  ip address {}/{}\n".format(ibgp_svi_address,ipaddress.ip_network(ibgp_address_range).prefixlen)
+                    mlag_interface_section += "!\n"
+                else:
+                    mlag_vrf_section += "vrf instance {}\n".format(vrf)
+                    mlag_vrf_section += "!\n"
+                    mlag_vlan_section += "vlan {}\n".format(vlan)
+                    mlag_vlan_section += "  name {}_IBGP_PEER\n".format(vrf)
+                    mlag_vlan_section += "  trunk group {}_IBGP_PEER\n".format(vrf)
+                    mlag_vlan_section += "!\n"
+                    mlag_interface_section += "interface Vlan{}\n".format(vlan)
+                    mlag_interface_section += "  description {}_IBGP_PEER\n".format(vrf)
+                    mlag_interface_section += "  vrf forwarding {}\n".format(vrf)
+                    mlag_interface_section += "  ip addrress {}/{}\n".format(ibgp_svi_address,ipaddress.ip_network(ibgp_address_range).prefixlen)
+                    mlag_interface_section += "!\n"
+
+            mlag_ibgp_section += "router bgp {}\n".format(asn)
+            mlag_ibgp_section += "  neighbor {} remote-as {}\n".format(ibgp_neighbor_address, asn)
+            mlag_ibgp_section += "  neighbor {} next-hop self\n".format(ibgp_neighbor_address)
+            mlag_ibgp_section += "  neighbor {} allowas-in 1\n".format(ibgp_neighbor_address)
+            mlag_ibgp_section += "  neighbor {} maximum-routes 12000\n".format(ibgp_neighbor_address)
+            mlag_ibgp_section += "!\n"
+
+        mlag_interface_section = switch_helpers.sortInterfaceConfig(mlag_interface_section)
+
+        mlag_elements = [mlag_general_section, mlag_vlan_section, mlag_vrf_section, mlag_interface_section,
+                        mlag_mlag_section, mlag_ibgp_section]
+
+        return "".join(mlag_elements)
 
     def build_ip_interface_underlay(self, interfaces_to_ips=None):
         """
@@ -258,15 +310,17 @@ class Switch():
             ip_interface_config.append("interface {}".format(interface))
             ip_interface_config.append("  no switchport")
             ip_interface_config.append("  ip address {}".format(ip_address))
-            ip_interface_config.append("")   
-        return "\n".join(ip_interface_config)
+            ip_interface_config.append("!")   
 
-    def build_bgp_underlay(self, asn, role, loopback0_address, remote_ases_and_neighbors):
+        ip_interface_config = switch_helpers.sortInterfaceConfig("\n".join(ip_interface_config))
+        return ip_interface_config
+
+    def build_bgp_underlay(self, asn, role, underlay_source_address, remote_ases_and_neighbors, underlay_source_interface="Loopback0"):
         """
         Args
             asn ( int ) --> asn number
             role ( str ) --> "leaf" or "spine"
-            loopback0_address (str)  --> address of loopback 0 in CIDR notation; i.e. "1.1.1.1/32"
+            underlay_source_address (str)  --> address of loopback 0 in CIDR notation; i.e. "1.1.1.1/32"
             number of neighbors ( int ) -->  number of neighbors to peer with
             mlag_enabled ( bool ) --> flag to signal if mlag is enabled (should we set a virtual-router mac-address)
             remote_ases_and_neighbors ( {int: [str]} ) --> dictionary where keys are keys are remote ases and values are neighbors that will belong to those ases.
@@ -279,14 +333,14 @@ class Switch():
 
         bgp_underlay_config = []
 
-        bgp_underlay_config.append("interface loopback 0")
-        bgp_underlay_config.append("  ip address {}".format(loopback0_address))
-        bgp_underlay_config.append("")
+        bgp_underlay_config.append("interface {}".format(underlay_source_interface))
+        bgp_underlay_config.append("  ip address {}".format(underlay_source_address))
+        bgp_underlay_config.append("!")
 
         bgp_underlay_config.append("ip routing")
-        bgp_underlay_config.append("")
+        bgp_underlay_config.append("!")
         bgp_underlay_config.append("service routing protocols model multi-agent")
-        bgp_underlay_config.append("")
+        bgp_underlay_config.append("!")
 
         #Build bgp config
         if role == "leaf":
@@ -297,7 +351,7 @@ class Switch():
             assert "Invalid role"
             return
         bgp_underlay_config.append("router bgp {}".format(asn))
-        bgp_underlay_config.append("  router-id {}".format(loopback0_address.split("/")[0]))
+        bgp_underlay_config.append("  router-id {}".format(underlay_source_address.split("/")[0]))
         bgp_underlay_config.append("  maximum-paths {} ecmp {}".format(number_of_neighbors, number_of_neighbors))
         bgp_underlay_config.append("  neighbor {} peer-group".format(peer_group))
         bgp_underlay_config.append("  neighbor {} fall-over bfd".format(peer_group))
@@ -313,11 +367,11 @@ class Switch():
                 for neighbor in bgp_neighbors:
                     bgp_underlay_config.append("  neighbor {} remote-as {}".format(neighbor, remote_as))
         bgp_underlay_config.append("  redistribute connected")
-        bgp_underlay_config.append("")
+        bgp_underlay_config.append("!")
 
         return "\n".join(bgp_underlay_config)
         
-    def build_vxlan_data_plane(self, vlans_to_vnis, source_interface_address, port=4789, source_interface="loopback 1"):
+    def build_vxlan_data_plane(self, vlans_to_vnis, overlay_source__address, port=4789, overlay_source_interface="Loopback1"):
         """
         Args:
             vlans_to_vnis ( {int:int} ) --> dictionary of vlan to vni mappings, vlan is key vni is value
@@ -328,25 +382,23 @@ class Switch():
         vxlan_config = []
         
         #build vxlan config
-        vxlan_config.append("interface {}".format(source_interface))
-        vxlan_config.append("  ip address {}".format(source_interface_address))
-        vxlan_config.append("")
+        vxlan_config.append("interface {}".format(overlay_source_interface))
+        vxlan_config.append("  ip address {}".format(overlay_source__address))
+        vxlan_config.append("!")
 
         if chipModelInfo[self.chipset]["family"] == "Sand":
             vxlan_config.append("hardware tcam")
             vxlan_config.append("system profile vxlan-routing")
+            vxlan_config.append("!")
 
-        vxlan_config.append("")
-
-        vxlan_config.append("interface vxlan 1")
-        vxlan_config.append("  vxlan source-interface {}".format(source_interface))
+        vxlan_config.append("interface Vxlan1")
+        vxlan_config.append("  vxlan source-interface {}".format(overlay_source_interface))
         vxlan_config.append("  vxlan udp-port {}".format(port))
-
         #Sort vlans
         vlans_to_vnis = OrderedDict(sorted(vlans_to_vnis.items()))
         for vlan, vni in vlans_to_vnis.items():
             vxlan_config.append("  vxlan vlan {} vni {}".format(vlan, vni))
-        vxlan_config.append("")
+        vxlan_config.append("!")
 
         return "\n".join(vxlan_config)
 
@@ -368,9 +420,10 @@ class Switch():
         if control_plane == "static":
             if vtep_peers is None:
                 assert "Error: Static chosen as control plane and no vtep_peers provided."
-            config.append("interface vxlan 1")
+            config.append("interface Vxlan1")
             for vtep in vtep_peers:
                 config.append("  vxlan flood vtep {}".format(vtep))
+            config.append("!")
 
         elif control_plane == "cvx":
             config = self.build_cvx(cvx_address)
@@ -398,7 +451,12 @@ class Switch():
             svi_to_address ( {int:str}) --> dictionary of vlans to virtual ip addresses
             virtual_address_mode ( str ) --> signals to use 'ip address virtual' or 'ip virtual-router address' for svi vIP
         """
-        config = []
+        
+        vrf_config = []
+        interface_config = []
+        bgp_config = []
+
+
         if evpn_peers is None or asn is None:
             assert "Error: EVPN chosen as control plane and either no evpn peers provided or no BGP asn provided"
             return
@@ -416,71 +474,73 @@ class Switch():
         for bgp_asn, neighbors in evpn_peers.items():
             number_of_neighbors += len(neighbors)
 
-        config.append("router bgp {}".format(asn))
-        config.append("  neighbor {} peer-group".format(peer_group))
-        config.append("  neighbor {} next-hop unchanged".format(peer_group))
-        config.append("  neighbor {} update-source {}".format(peer_group, source_interface))
-        config.append("  neighbor {} ebgp-multihop".format(peer_group))
-        config.append("  neighbor {} send-community extended".format(peer_group))
-        config.append("  neighbor {} maximum-routes 0".format(peer_group))
+        bgp_config.append("router bgp {}".format(asn))
+        bgp_config.append("  neighbor {} peer-group".format(peer_group))
+        bgp_config.append("  neighbor {} next-hop unchanged".format(peer_group))
+        bgp_config.append("  neighbor {} update-source {}".format(peer_group, source_interface))
+        bgp_config.append("  neighbor {} ebgp-multihop".format(peer_group))
+        bgp_config.append("  neighbor {} send-community extended".format(peer_group))
+        bgp_config.append("  neighbor {} maximum-routes 0".format(peer_group))
 
         for remote_as, bgp_neighbors in evpn_peers.items():
             for neighbor in bgp_neighbors:
-                config.append("  neighbor {} peer-group {}".format(neighbor, peer_group))
+                bgp_config.append("  neighbor {} peer-group {}".format(neighbor, peer_group))
         if len(evpn_peers) == 1:
-            config.insert(-(number_of_neighbors), "  neighbor {} remote-as {}".format(peer_group, next(iter(evpn_peers))))
+            bgp_config.insert(-(number_of_neighbors), "  neighbor {} remote-as {}".format(peer_group, next(iter(evpn_peers))))
         else:
             for remote_as, bgp_neighbors in evpn_peers.items():
                 for neighbor in bgp_neighbors:
-                    config.append("  neighbor {} remote-as {}".format(neighbor, remote_as))
-        config.append("  !")
-        config.append("  address-family evpn")
-        config.append("    neighbor {} activate".format(peer_group))
-        config.append("  !")
-        config.append("  address-family ipv4")
-        config.append("    no neighbor {} activate".format(peer_group))
-        config.append("  !")
+                    bgp_config.append("  neighbor {} remote-as {}".format(neighbor, remote_as))
+        bgp_config.append("  !")
+        bgp_config.append("  address-family evpn")
+        bgp_config.append("    neighbor {} activate".format(peer_group))
+        bgp_config.append("  !")
+        bgp_config.append("  address-family ipv4")
+        bgp_config.append("    no neighbor {} activate".format(peer_group))
+        bgp_config.append("  !")
 
         if role == "leaf":
             if evpn_model == "central":
                 pass
             elif evpn_model == "symmetric" or evpn_model == "asymmetric":
                 if evpn_model == "symmetric":
-                    config.insert(0, "vrf definition {}".format(vrf))
-                    config.insert(1, "")
-                    config.append("  vrf {}".format(vrf))
-                    config.append("    rd {}:{}".format(vrf_route_distinguisher, vrf_route_target))
-                    config.append("    route-target import 1:{}".format(vrf_route_target))
-                    config.append("    route-target export 1:{}".format(vrf_route_target))
-                    config.append("    redistribute connected")
-                    config.append("    redistribute static")
-                    config.append("  !")
+                    vrf_config.append("vrf instance {}".format(vrf))
+                    vrf_config.append("!")
+                    bgp_config.append("  vrf {}".format(vrf))
+                    bgp_config.append("    rd {}:{}".format(vrf_route_distinguisher, vrf_route_target))
+                    bgp_config.append("    route-target import 1:{}".format(vrf_route_target))
+                    bgp_config.append("    route-target export 1:{}".format(vrf_route_target))
+                    bgp_config.append("    redistribute connected")
+                    bgp_config.append("    redistribute static")
+                    bgp_config.append("  !")
 
                 #Order SVIs
                 svi_to_address = OrderedDict(sorted(svi_to_address.items()))
-                config_index = 0
                 for vlan, address in svi_to_address.items():
-                    svi_config = ""
-                    svi_config += "interface vlan {}\n".format(vlan)
+                    interface_config.append("interface Vlan{}".format(vlan))
                     if evpn_model == "symmetric":
-                        svi_config += "  no autostate\n"
-                        svi_config += "  vrf forwarding {}\n".format(vrf)
+                        interface_config.append("  no autostate")
+                        interface_config.append("  vrf forwarding {}".format(vrf))
                     if virtual_address_mode == "ip address virtual":
-                        svi_config += "  ip address virtual {}\n".format(address)
+                        interface_config.append("  ip address virtual {}".format(address))
                     else:
-                        svi_config += "  ip virtual-router address {}".format(address)
-                    config.insert(config_index, svi_config)
-                    config_index += 1
-                    config.append("  vlan {}".format(vlan))
-                    config.append("    rd {}:{}".format(mac_vrf_route_distinguisher, vlan))
-                    config.append("    route-target both 1:{}".format(vlan))
-                    config.append("    redistribute learned")
-                    config.append("  !")
+                        interface_config.append("  ip virtual-router address {}".format(address))
+                    interface_config.append("!")
+                    bgp_config.append("  vlan {}".format(vlan))
+                    bgp_config.append("    rd {}:{}".format(mac_vrf_route_distinguisher, vlan))
+                    bgp_config.append("    route-target both 1:{}".format(vlan))
+                    bgp_config.append("    redistribute learned")
+                    bgp_config.append("  !")
 
             else:
                 assert "Error: Invalid evpn model.  Options are 'central', 'symmetric', and 'asymmetric'"
 
-        return config
+
+
+        evpn_config = ["\n".join(vrf_config), "\n".join(interface_config), "\n".join(bgp_config)]
+
+        evpn_config = ["\n".join(evpn_config)]
+        return evpn_config
 
     def build_cvx(self, cvx_address):
         config = []
@@ -490,9 +550,10 @@ class Switch():
         config.append("management cvx")
         config.append("  server host {}".format(cvx_address))
         config.append("  no shutdown")
-        config.append("")
-        config.append("interface vxlan 1")
+        config.append("!")
+        config.append("interface Vxlan1")
         config.append("  vxlan controller-client")
+        config.append("!")
         return config
         
 
@@ -514,25 +575,4 @@ class Switch():
         for k in sorted(interface_speeds, key=lambda k: len(interface_speeds[k]), reverse=True):
             ordered_interface_speeds[k] = interface_speeds[k]
         return ordered_interface_speeds
-
-def parse_show_interfaces_json(output):
-    raw_interface_info = json.loads(output)
-    raw_interface_info = raw_interface_info["interfaces"]
-    raw_interface_info = OrderedDict(sorted(raw_interface_info.items()))
-    list_of_interface_info = []
-    for iface, details in raw_interface_info.items():
-        interface_details = {}
-        interface_details["hardware_type"] = details["hardware"]
-        interface_details["description"] = details["description"]
-        interface_details["link_status"] = details["interfaceStatus"]
-        interface_details["protocol_status"] = details["lineProtocolStatus"]
-        interface_details["bia"] = details["burnedInAddress"] if "burnedInAddress" in details.keys() else ""
-        interface_details["bandwidth"] = details["bandwidth"] 
-        interface_details["address"] = details["physicalAddress"] if "physicalAddress" in details.keys() else ""
-        interface_details["interface"] = details["name"]
-        interface_details["mtu"] = details["mtu"]
-        interface_details["ip_address"] = details["interfaceAddress"]
-        list_of_interface_info.append(interface_details)
-    return list_of_interface_info
-
 
